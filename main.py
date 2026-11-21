@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import pickle
 import threading
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,6 +25,8 @@ CSV_PATH = Path(os.getenv("CSV_PATH", BASE_DIR / "cleaned_brokemeter_data.csv"))
 STORE_PATH = Path(os.getenv("STORE_PATH", BASE_DIR / "telemetry_store.json"))
 ADMIN_KEY = os.getenv("ADMIN_KEY", "brokemeter-admin")
 MAX_LOGS = 200
+MAX_EXITS = 200
+LIVE_WINDOW_SECONDS = 4.0
 
 model = None
 df_spendings: Optional[pd.DataFrame] = None
@@ -33,7 +35,9 @@ store_lock = threading.Lock()
 state: Dict[str, Any] = {
     "site_enabled": True,
     "logs": deque(maxlen=MAX_LOGS),
+    "exits": deque(maxlen=MAX_EXITS),
     "active_sessions": {},
+    "open_counter": 0,
 }
 
 
@@ -53,9 +57,13 @@ def _load_store() -> None:
         saved_logs = raw.get("logs", [])
         if isinstance(saved_logs, list):
             state["logs"] = deque(saved_logs[-MAX_LOGS:], maxlen=MAX_LOGS)
+        saved_exits = raw.get("exits", [])
+        if isinstance(saved_exits, list):
+            state["exits"] = deque(saved_exits[-MAX_EXITS:], maxlen=MAX_EXITS)
         saved_sessions = raw.get("active_sessions", {})
         if isinstance(saved_sessions, dict):
             state["active_sessions"] = saved_sessions
+        state["open_counter"] = int(raw.get("open_counter", 0))
     except Exception as exc:
         logger.warning("Could not load telemetry store: %s", exc)
 
@@ -65,7 +73,9 @@ def _save_store() -> None:
         payload = {
             "site_enabled": state["site_enabled"],
             "logs": list(state["logs"]),
+            "exits": list(state["exits"]),
             "active_sessions": state["active_sessions"],
+            "open_counter": state["open_counter"],
         }
         with open(STORE_PATH, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
@@ -124,7 +134,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="BrokeMeter Rigorous ML & Telemetry API",
-    description="College Student Month-End Zero-Balance Forecaster + Remote Telemetry & Control",
+    description="College Student Month-End Zero-Balance Forecaster + Live Presence, Exits & Remote Control",
     lifespan=lifespan,
 )
 
@@ -160,6 +170,19 @@ class ClientMeta(BaseModel):
     viewport: Optional[str] = Field(default=None, max_length=50)
 
 
+class PresenceEvent(BaseModel):
+    event: Literal["open", "heartbeat", "exit"] = "heartbeat"
+    session_id: str = Field(..., min_length=1, max_length=100)
+    page_url: Optional[str] = Field(default=None, max_length=300)
+    platform: Optional[str] = Field(default=None, max_length=100)
+    language: Optional[str] = Field(default=None, max_length=50)
+    timezone: Optional[str] = Field(default=None, max_length=100)
+    screen: Optional[str] = Field(default=None, max_length=50)
+    viewport: Optional[str] = Field(default=None, max_length=50)
+    duration_sec: Optional[float] = Field(default=None, ge=0)
+    exit_reason: Optional[str] = Field(default=None, max_length=80)
+
+
 class BudgetRequest(BaseModel):
     allowance: float = Field(..., ge=0, description="Total monthly allowance")
     bills: float = Field(..., ge=0, description="Fixed monthly bills/rent")
@@ -172,6 +195,47 @@ class BudgetRequest(BaseModel):
 
 class SiteToggleRequest(BaseModel):
     enabled: bool
+
+
+def _upsert_session(
+    session_id: str,
+    client_ip: str,
+    user_agent: str,
+    now_dt: datetime,
+    meta: Dict[str, Any],
+    is_open_event: bool = False,
+    is_exit_event: bool = False,
+) -> bool:
+    existing = state["active_sessions"].get(session_id)
+    opened_at_epoch = existing.get("opened_at_epoch", now_dt.timestamp()) if existing else now_dt.timestamp()
+    opened_at_utc = existing.get("opened_at_utc", now_dt.isoformat()) if existing else now_dt.isoformat()
+    is_new_open = is_open_event or (existing is None)
+
+    if is_new_open:
+        state["open_counter"] = int(state.get("open_counter", 0)) + 1
+        opened_at_epoch = now_dt.timestamp()
+        opened_at_utc = now_dt.isoformat()
+
+    last_seen_epoch = 0.0 if is_exit_event else now_dt.timestamp()
+
+    state["active_sessions"][session_id] = {
+        "session_id": session_id,
+        "ip": client_ip,
+        "user_agent": user_agent,
+        "page_url": meta.get("page_url") or (existing.get("page_url") if existing else "unknown"),
+        "platform": meta.get("platform") or (existing.get("platform") if existing else "unknown"),
+        "language": meta.get("language") or (existing.get("language") if existing else "unknown"),
+        "timezone": meta.get("timezone") or (existing.get("timezone") if existing else "unknown"),
+        "screen": meta.get("screen") or (existing.get("screen") if existing else "unknown"),
+        "viewport": meta.get("viewport") or (existing.get("viewport") if existing else "unknown"),
+        "opened_at_utc": opened_at_utc,
+        "opened_at_epoch": opened_at_epoch,
+        "last_seen_utc": now_dt.isoformat(),
+        "last_seen_epoch": last_seen_epoch,
+        "watching": not is_exit_event,
+        "open_seq": state["open_counter"] if is_new_open else (existing.get("open_seq", 0) if existing else 0),
+    }
+    return is_new_open
 
 
 @app.get("/")
@@ -218,23 +282,82 @@ def toggle_site(payload: SiteToggleRequest, x_admin_key: Optional[str] = Header(
     }
 
 
+@app.post("/api/presence")
+def track_presence(payload: PresenceEvent, request: Request):
+    now_dt = datetime.now(timezone.utc)
+    client_ip = _extract_client_ip(request)
+    user_agent = request.headers.get("user-agent", "unknown")
+    meta = payload.model_dump()
+
+    with store_lock:
+        is_open = payload.event == "open"
+        is_exit = payload.event == "exit"
+        is_new_open = _upsert_session(
+            session_id=payload.session_id,
+            client_ip=client_ip,
+            user_agent=user_agent,
+            now_dt=now_dt,
+            meta=meta,
+            is_open_event=is_open,
+            is_exit_event=is_exit,
+        )
+
+        if is_exit:
+            existing = state["active_sessions"].get(payload.session_id) or {}
+            opened_epoch = existing.get("opened_at_epoch", now_dt.timestamp())
+            computed_duration = (
+                payload.duration_sec
+                if payload.duration_sec is not None
+                else max(0.0, now_dt.timestamp() - opened_epoch)
+            )
+            state["exits"].append({
+                "timestamp_utc": now_dt.isoformat(),
+                "timestamp_epoch": now_dt.timestamp(),
+                "session_id": payload.session_id,
+                "ip": client_ip,
+                "platform": meta.get("platform") or existing.get("platform") or "unknown",
+                "screen": meta.get("screen") or existing.get("screen") or "unknown",
+                "viewport": meta.get("viewport") or existing.get("viewport") or "unknown",
+                "duration_sec": _safe_float(computed_duration, default=0.0, decimals=1),
+                "exit_reason": payload.exit_reason or "page_exit",
+                "user_agent": user_agent,
+            })
+
+        _save_store()
+
+    return {
+        "status": "ok",
+        "event": payload.event,
+        "new_open": is_new_open,
+    }
+
+
 @app.get("/api/telemetry")
 def get_telemetry(x_admin_key: Optional[str] = Header(default=None)):
     _verify_admin(x_admin_key)
     now_ts = datetime.now(timezone.utc).timestamp()
     with store_lock:
-        active_users = [
-            info for info in state["active_sessions"].values()
-            if (now_ts - info.get("last_seen_epoch", 0)) <= 300
+        watching_users = [
+            dict(info, watching=True)
+            for info in state["active_sessions"].values()
+            if info.get("watching", True) and (now_ts - info.get("last_seen_epoch", 0)) <= LIVE_WINDOW_SECONDS
         ]
-        active_users.sort(key=lambda x: x.get("last_seen_epoch", 0), reverse=True)
+        watching_users.sort(key=lambda x: x.get("opened_at_epoch", 0), reverse=True)
+
+        just_opened_users = watching_users[:15]
+        exits_list = list(reversed(list(state["exits"])))
         logs_list = list(reversed(list(state["logs"])))
         enabled = bool(state["site_enabled"])
+        open_counter = int(state.get("open_counter", 0))
 
     return {
         "site_enabled": enabled,
-        "connected_users_count": len(active_users),
-        "connected_users": active_users[:50],
+        "live_watching_count": len(watching_users),
+        "live_watching_users": watching_users[:50],
+        "just_opened_users": just_opened_users,
+        "open_counter": open_counter,
+        "exits_count": len(exits_list),
+        "exits": exits_list[:100],
         "total_predictions_logged": len(logs_list),
         "predictions": logs_list[:100],
     }
@@ -380,17 +503,15 @@ def predict_doom(data: BudgetRequest, request: Request):
 
     with store_lock:
         state["logs"].append(event_record)
-        state["active_sessions"][session_id] = {
-            "session_id": session_id,
-            "ip": client_ip,
-            "user_agent": user_agent,
-            "platform": meta.get("platform") or "unknown",
-            "timezone": meta.get("timezone") or "unknown",
-            "screen": meta.get("screen") or "unknown",
-            "viewport": meta.get("viewport") or "unknown",
-            "last_seen_utc": now_dt.isoformat(),
-            "last_seen_epoch": now_dt.timestamp(),
-        }
+        _upsert_session(
+            session_id=session_id,
+            client_ip=client_ip,
+            user_agent=user_agent,
+            now_dt=now_dt,
+            meta=meta,
+            is_open_event=False,
+            is_exit_event=False,
+        )
         _save_store()
 
     return result
