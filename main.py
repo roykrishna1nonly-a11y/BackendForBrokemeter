@@ -12,7 +12,6 @@ from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
 import numpy as np
 import pandas as pd
 from pydantic import BaseModel, Field
@@ -198,9 +197,11 @@ def health_check():
 
 @app.get("/api/site-status")
 def get_site_status():
+    enabled = bool(state["site_enabled"])
     return {
-        "enabled": bool(state["site_enabled"]),
-        "message": "BrokeMeter is live." if state["site_enabled"] else "BrokeMeter is temporarily turned off by admin.",
+        "enabled": enabled,
+        "maintenance": not enabled,
+        "message": "BrokeMeter is live." if enabled else "Site ongoing maintenance.",
     }
 
 
@@ -210,7 +211,11 @@ def toggle_site(payload: SiteToggleRequest, x_admin_key: Optional[str] = Header(
     with store_lock:
         state["site_enabled"] = bool(payload.enabled)
         _save_store()
-    return {"enabled": state["site_enabled"], "status": "updated"}
+    return {
+        "enabled": state["site_enabled"],
+        "maintenance": not state["site_enabled"],
+        "status": "updated",
+    }
 
 
 @app.get("/api/telemetry")
@@ -259,7 +264,7 @@ def predict_doom(data: BudgetRequest, request: Request):
     if not state["site_enabled"]:
         raise HTTPException(
             status_code=503,
-            detail="BrokeMeter is currently switched OFF by the administrator.",
+            detail="Site ongoing maintenance.",
         )
 
     balance = data.allowance - data.bills
