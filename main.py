@@ -26,6 +26,7 @@ STORE_PATH = Path(os.getenv("STORE_PATH", BASE_DIR / "telemetry_store.json"))
 ADMIN_KEY = os.getenv("ADMIN_KEY", "brokemeter-admin")
 MAX_LOGS = 200
 MAX_EXITS = 200
+MAX_OPENED_HISTORY = 300
 LIVE_WINDOW_SECONDS = 4.0
 
 model = None
@@ -36,6 +37,7 @@ state: Dict[str, Any] = {
     "site_enabled": True,
     "logs": deque(maxlen=MAX_LOGS),
     "exits": deque(maxlen=MAX_EXITS),
+    "opened_history": [],
     "active_sessions": {},
     "open_counter": 0,
 }
@@ -60,10 +62,13 @@ def _load_store() -> None:
         saved_exits = raw.get("exits", [])
         if isinstance(saved_exits, list):
             state["exits"] = deque(saved_exits[-MAX_EXITS:], maxlen=MAX_EXITS)
+        saved_opened = raw.get("opened_history", [])
+        if isinstance(saved_opened, list):
+            state["opened_history"] = saved_opened[-MAX_OPENED_HISTORY:]
         saved_sessions = raw.get("active_sessions", {})
         if isinstance(saved_sessions, dict):
             state["active_sessions"] = saved_sessions
-        state["open_counter"] = int(raw.get("open_counter", 0))
+        state["open_counter"] = int(raw.get("open_counter", len(state["opened_history"])))
     except Exception as exc:
         logger.warning("Could not load telemetry store: %s", exc)
 
@@ -74,6 +79,7 @@ def _save_store() -> None:
             "site_enabled": state["site_enabled"],
             "logs": list(state["logs"]),
             "exits": list(state["exits"]),
+            "opened_history": state["opened_history"][-MAX_OPENED_HISTORY:],
             "active_sessions": state["active_sessions"],
             "open_counter": state["open_counter"],
         }
@@ -197,6 +203,22 @@ class SiteToggleRequest(BaseModel):
     enabled: bool
 
 
+def _sync_opened_history(record: Dict[str, Any]) -> None:
+    sid = record["session_id"]
+    for idx, item in enumerate(state["opened_history"]):
+        if item.get("session_id") == sid:
+            merged = dict(item)
+            merged.update(record)
+            merged["open_seq"] = item.get("open_seq", record.get("open_seq", idx + 1))
+            merged["opened_at_epoch"] = item.get("opened_at_epoch", record.get("opened_at_epoch"))
+            merged["opened_at_utc"] = item.get("opened_at_utc", record.get("opened_at_utc"))
+            state["opened_history"][idx] = merged
+            return
+    state["opened_history"].append(dict(record))
+    if len(state["opened_history"]) > MAX_OPENED_HISTORY:
+        state["opened_history"] = state["opened_history"][-MAX_OPENED_HISTORY:]
+
+
 def _upsert_session(
     session_id: str,
     client_ip: str,
@@ -218,7 +240,7 @@ def _upsert_session(
 
     last_seen_epoch = 0.0 if is_exit_event else now_dt.timestamp()
 
-    state["active_sessions"][session_id] = {
+    session_record = {
         "session_id": session_id,
         "ip": client_ip,
         "user_agent": user_agent,
@@ -235,6 +257,9 @@ def _upsert_session(
         "watching": not is_exit_event,
         "open_seq": state["open_counter"] if is_new_open else (existing.get("open_seq", 0) if existing else 0),
     }
+
+    state["active_sessions"][session_id] = session_record
+    _sync_opened_history(session_record)
     return is_new_open
 
 
@@ -345,16 +370,29 @@ def get_telemetry(x_admin_key: Optional[str] = Header(default=None)):
         watching_users.sort(key=lambda x: x.get("opened_at_epoch", 0), reverse=True)
 
         just_opened_users = watching_users[:15]
+
+        all_opened_users = []
+        for item in reversed(state["opened_history"]):
+            copy_item = dict(item)
+            is_currently_watching = bool(
+                copy_item.get("watching", False)
+                and (now_ts - copy_item.get("last_seen_epoch", 0)) <= LIVE_WINDOW_SECONDS
+            )
+            copy_item["currently_watching"] = is_currently_watching
+            all_opened_users.append(copy_item)
+
         exits_list = list(reversed(list(state["exits"])))
         logs_list = list(reversed(list(state["logs"])))
         enabled = bool(state["site_enabled"])
-        open_counter = int(state.get("open_counter", 0))
+        open_counter = int(state.get("open_counter", len(all_opened_users)))
 
     return {
         "site_enabled": enabled,
         "live_watching_count": len(watching_users),
         "live_watching_users": watching_users[:50],
         "just_opened_users": just_opened_users,
+        "all_opened_users": all_opened_users[:MAX_OPENED_HISTORY],
+        "all_opened_count": len(all_opened_users),
         "open_counter": open_counter,
         "exits_count": len(exits_list),
         "exits": exits_list[:100],
